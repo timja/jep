@@ -108,7 +108,7 @@ Schema changes must not stop a running cluster, and old and new controllers run 
 
 === Operations
 
-* *Helm chart* (`+charts/cloud-native-jenkins+`):
+* *Helm chart* (`+charts/jenkins-cluster+`):
 ** a StatefulSet of N controllers with `+emptyDir+` homes
 ** a non-sticky Service
 ** the seeded key Secret
@@ -176,7 +176,7 @@ There are no new infrastructure requirements related to this proposal.
 
 * *Cluster plugins* (link:https://github.com/timja/cluster-plugin[timja/cluster-plugin]): `+PostgresPersistenceStore+`, `+PostgresPersistenceStoreProvider+`, `+AzureBlobStore(Provider)+`, `+PeerVersionCheck+`, `+KeyCheck+`, `+SchemaMigrations+`, `+MemberStatus+`, `+HomeImporter+`, `+ClusterView+`.
 * *Core:* prototype branches of Jenkins core `+cnj/t14-m1-resilience+` (retries, temporary keys, `+sweepSoon+`) and `+cnj/t15-remaining+`.
-* *Chart:* `+charts/cloud-native-jenkins+` in link:https://github.com/timja/cluster-plugin[timja/cluster-plugin].
+* *Chart:* `+charts/jenkins-cluster+` in link:https://github.com/timja/cluster-plugin[timja/cluster-plugin].
 * *Findings:* documents in the timja/cloud-native-jenkins repository (the prototype's notes and findings): `+findings/ET9-kubernetes.md+`, `+ET10-operations.md+`, `+ET14-store-outage.md+` and `+ET16-scale.md+`.
 
 == References
