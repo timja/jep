@@ -39,7 +39,7 @@ endif::[]
 
 == Abstract
 
-Every running build has exactly one owner: the controller holding its lease. A Pipeline ships save points (its program state and flow nodes) to blob storage as it runs. When its owner dies, another controller takes the lease, with a higher epoch, and resumes the Pipeline from the latest save point, with no shared disk. An owner that lost its lease (for example after a pause or a partition) is fenced: it stops the build and never publishes it. Builds nothing can resume are closed as aborted rather than vanishing.
+Every running build has exactly one owner: the controller holding its lease. A Pipeline ships save points (its program state and flow nodes) to blob storage as it runs. When its owner dies, another controller takes the lease, with a higher epoch, and resumes the Pipeline from the latest save point, with no shared disk. An owner that lost its lease (for example after a pause or a partition) is fenced once it reaches the store again: it stops the build and never publishes it. Builds nothing can resume are closed as aborted rather than vanishing.
 
 == Specification
 
@@ -57,7 +57,7 @@ Every running build has exactly one owner: the controller holding its lease. A P
 ** whenever its membership may have lapsed (heartbeats missing for longer than the member timeout)
 +
 On evidence from the store that a lease is lost, it stops the build locally (`+lost+`) and never publishes it.
-* *No fencing on missing evidence.* If the store cannot be reached, a lease's state is unknown. The build carries on, while its log and save points wait until the heartbeat is back.
+* *No fencing on missing evidence.* If the store cannot be reached, a lease's state is unknown. The build carries on, while its log and save points wait until the heartbeat is back. This includes an owner that alone lost the database: after the member timeout another controller adopts its builds while it carries on. Until it reaches the store again and finds its lease lost, both run the build's steps; only publication is fenced. Steps with external side effects can therefore run twice, as after an adoption (Backwards Compatibility).
 
 === Save points (Pipelines)
 
@@ -111,7 +111,9 @@ A build is handed over only while it holds no other executor, so nested or paral
 
 * Without a store, nothing changes. `+BuildAdopter+` is a new extension point.
 * Pipeline steps that are not idempotent (for example a `+sh+` step whose process died with its controller) run again from the last save point after an adoption, as after a restart on one controller.
-* *Known limitation:* running only a `+node+` body on another controller's agent would need remote executors. Handover moves the whole build instead.
+* *Known limitations:*
+** Running only a `+node+` body on another controller's agent would need remote executors. Handover moves the whole build instead.
+** A controller that alone loses the database keeps running its builds while another adopts them (see No fencing on missing evidence): their steps run on both until it reaches the store again. *Future work:* a bounded self-fence, where a controller whose own heartbeats have failed for longer than the member timeout pauses its Pipelines at a save point, at the cost of pausing them in an outage of the whole store too.
 
 == Security
 

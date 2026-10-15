@@ -58,7 +58,7 @@ On start, a controller:
 . waits for both stores (see Resilience below)
 . checks that it has the cluster's key material (see above)
 . creates or migrates the schema, under a lock, if it is the first of a new version (see Schema migrations below)
-. refuses to start if a live peer speaks a protocol older than its `+minimumPeerProtocol+`
+. refuses to start if a live peer speaks a protocol older than its `+minimumPeerProtocol+`, or if its own protocol is below the cluster's protocol floor
 . registers itself with its first heartbeat
 . catches up: items, static configuration, build history and the plugin set are read from the stores, and update-site data is taken from the cluster
 . starts serving. Readiness probes and load balancers send it requests once it answers.
@@ -74,7 +74,7 @@ It leaves by stopping, cleanly (its row is deleted, and the others react at once
 ** A cleanly stopped controller deletes its row and announces it (`+NOTIFY+`), so others react at once.
 ** Rows dead for a day are pruned, and so are the per-controller counters they held.
 * *Leaving.* When a controller leaves, the others sweep its builds and queue items right away (JEP-252, JEP-253). Measured: the builds of a controller killed with `+SIGKILL+` were adopted 5.0–6.3 s later, and those of one stopped cleanly 6.5 s later. A controller paused for 12 s lost nothing.
-* *Protocol versions.* `+minimumPeerProtocol+` makes a new version refuse to start while older peers are alive, for changes that cannot coexist.
+* *Protocol versions.* `+minimumPeerProtocol+` makes a new version refuse to start while older peers are alive, for changes that cannot coexist. The other way round, a Contract step (below) records the protocol it needed as the cluster's floor, in the database; a controller speaking an older protocol then refuses to start, whatever its own minimum.
 
 === Resilience to store outages
 
@@ -104,7 +104,7 @@ Every connection has socket, connect, statement and lock timeouts and TCP keepal
 Schema changes must not stop a running cluster, and old and new controllers run side by side during a rolling upgrade. Migrations go in three steps, tracked in a `+jenkins_schema_migrations+` table and shown in the cluster view:
 * *Expand*, at startup, in the schema transaction: only changes that take no time, such as nullable columns. Indexes are built with `+create index concurrently+`, outside the transaction, so writes go on.
 * *Backfill*, in the background: batches of rows (1,000 by default), each in a transaction that also records a cursor. One controller does it at a time, and another takes over, from the cursor, if that one leaves. New code writes the new form itself, so the backfill only covers rows written before.
-* *Contract*, once the backfill is done and no live controller speaks an older protocol than the migration needs.
+* *Contract*, once the backfill is done and no live controller speaks an older protocol than the migration needs. From then on that protocol is the cluster's floor.
 
 === Operations
 
@@ -126,7 +126,7 @@ Schema changes must not stop a running cluster, and old and new controllers run 
 * *Rolling upgrade.* `+helm upgrade+` to a new image replaces controllers one at a time. Running Pipelines are adopted by the controllers still up, and mixed versions coexist within one protocol number.
 * *Import.* A file-based home is imported by starting one controller on it with `+importHome=true+`. Configuration, users, credentials, nodes, builds, logs and fingerprints are uploaded, keys already present are kept, and a report is written. Importing again imports nothing.
 * *Backup and restore.*
-** `+scripts/backup.sh+` does a `+pg_dump+` and then copies the blob container; `+scripts/restore.sh+` restores into a new namespace.
+** `+scripts/backup.sh+` does a `+pg_dump+` and then copies the blob container; `+scripts/restore.sh+` restores into a new namespace. The backup is consistent when no controller is running (scale the StatefulSet to 0 first). Taken while controllers run, it can restore records of builds deleted or republished during the copy with their files missing or newer. For an online backup, use point-in-time recovery (below).
 ** After a restore, builds that were running at backup time are adopted from their save points, or closed as aborted (JEP-252).
 ** *Point-in-time recovery.* Postgres is restored with its own tools (a base backup plus archived WAL, or a managed service's restore to a time), into a new database, and fresh controllers are started on it. The blob container must be restorable to the same point too; Azure Blob Storage's versioning and point-in-time restore do this. The cluster never deletes blobs later than their records (there is no deferred deletion), so without blob versioning a restore to an earlier time finds the records of builds deleted since, with their files gone.
 
@@ -149,6 +149,7 @@ Schema changes must not stop a running cluster, and old and new controllers run 
 * *Known limitations:*
 ** Point-in-time recovery needs blob versioning, which the Azure Storage emulator lacks; it is exercised for Postgres only.
 ** Liveness through session locks needs a direct database connection.
+** Two controllers of incompatible protocols started at the same moment can both pass the protocol checks before either has heartbeated; rolling upgrades start one at a time.
 ** *Future work:* a fresh controller's first full page of 2,000 jobs takes 5–19 s (0.6 s warm). That can be made much faster (not profiled yet; bulk reads or lazy loading are candidates); this is noted for later, not part of this JEP's first version.
 
 == Security
