@@ -33,8 +33,8 @@ endif::[]
 | BDFL-Delegate
 | TBD
 
-| Supersedes
-| the configuration-storage parts of JEP-213 (draft, never implemented)
+| Related
+| JEP-213 (Draft), which also proposes storing configuration externally; this JEP does not depend on it and does not supersede it
 |===
 
 == Abstract
@@ -57,7 +57,8 @@ An SPI for storing what Jenkins writes to `+JENKINS_HOME+` (item, global, descri
 *** `+subscribe(Consumer<ChangeEvent>)+`, where `+ChangeEvent+` is `+(kind, key, oldKey, version, origin)+`
 *** `+getOrigin()+`, which identifies this controller's instance
 ** `+owns(key)+` tells which keys the store holds; the others stay local.
-** Optional facets: `+liveOrigins()+`, `+leases()+` (JEP-252), `+queue()+` (JEP-253) and `+storesBuildRecords()+` (JEP-251).
+** Optional facets: `+liveOrigins()+`, `+leases()+` and `+writeIfHeld(…)+` (JEP-252), `+queue()+` (JEP-253), `+storesBuildRecords(jobKey)+` (JEP-251) and `+storesConfidentialKeys()+` (shared `+secrets/*+`, below).
+** The behaviour a backend must provide is stated under *Store contract*.
 * *`+BlobStore+`* holds large, immutable or append-only data: `+put+`, `+get+`, `+delete(prefix)+` and `+move(prefix)+`.
 * *`+PersistenceStoreProvider+` / `+BlobStoreProvider+`* are extension points. `+PersistenceStores.get()+` resolves the first provider that returns a store, once extensions are augmented. Files read before that come from the local disk, as do the pre-plugin key material and plugin set; see *Reasoning*.
 * *`+RemoteChangeHandler+`* is an extension point through which plugins apply changes to their own keys.
@@ -65,10 +66,23 @@ An SPI for storing what Jenkins writes to `+JENKINS_HOME+` (item, global, descri
 * *Per-controller state.* `+@PerController+` marks a class whose saved state belongs to the controller it runs on (caches, statistics, what this controller alone is connected to). `+LocalFiles+` is an extension point declaring other per-controller paths. Core declares its own (`+queue.xml+`, `+nodeMonitors.xml+`, the update center's state, the setup wizard's markers), so the store keeps no list of core's files.
 * *`+Item.getItemUuid()+`* is an identity a rename or move does not change, kept in the item's `+config.xml+`: a random UUID for new items (a new one for a copy), and for an item saved before, a name-based UUID derived from its full name when it was first loaded. Plugins keeping data outside `+JENKINS_HOME+` keyed by job name can key it by this instead.
 
+=== Store contract
+
+The words MUST and SHOULD are used as in RFC 2119. A backend (a `+PersistenceStore+` implementation) is written from this section.
+
+* *Versions.* Every entry has a positive version. A key's version MUST increase with every modification of it, and MUST keep increasing across the key's deletion and re-creation, so that a subscriber can tell a change older than the version it last read or wrote. The reference backend draws versions from one global sequence.
+* *`+write+`* is a compare-and-set. It MUST throw `+ConflictException+` when `+expectedVersion+` is neither `+ANY+` nor the stored version, and `+ABSENT+` MUST succeed only when the key does not exist. Writing content identical to the stored content MUST NOT create a new version and MUST NOT produce a change event.
+* *`+delete+`* of a key that does not exist MUST succeed, whatever `+expectedVersion+` is. Otherwise it is a compare-and-set as `+write+`. `+deleteAll(prefix)+` MUST delete every key below the prefix, each with its own deletion event.
+* *`+move+`* MUST be atomic. It MUST throw `+ConflictException+` if the target prefix or anything below it exists, MUST give every moved entry a new version, and MUST return each entry moved (key and version before and after). Its change events MUST be delivered shallower keys first, so an item's configuration arrives before the entries below it.
+* *`+owns(key)+`* MUST be cheap and MUST give the same answer for the lifetime of the store. Below an item's directory it MUST depend only on the path relative to that directory, so that renaming or moving an item never changes which of its files the store holds. A store MUST NOT own a build record (`+<job>/builds/<N>/build.xml+`) or `+secrets/*+`, which are read and written directly. A store for which `+storesBuildRecords(job)+` is true MUST own `+<job>/nextBuildNumber+`. `+storesConfidentialKeys()+` is opt-in: a store not meant to hold key material, even encrypted, MUST NOT opt in.
+* *Events.* `+subscribe+` MUST deliver every change made through any instance of the store, this one included, in the order the changes were committed. Delivery MAY be repeated (at least once), so a subscriber ignores an event at or below the version it already has. A store MUST NOT lose events across a reconnect. A listener that throws MUST NOT stop other listeners getting the event or fail the change that caused it.
+* *Origin.* `+getOrigin()+` MUST identify this instance and differ for every start of a controller, since membership, leases and adoption go by origin.
+* *Liveness and leases.* A store that returns `+leases()+` MUST also return `+liveOrigins()+`, and a lease lapses when its holder is no longer live as the store decides (for example by heartbeats on the database's own clock), never by the holder's clock. The lease contract is in JEP-252. `+writeIfHeld+` MUST check the lease and write in one atomic step; an implementation that checks and then writes lets a fenced owner overwrite the new owner's record. The default method in core does exactly that and SHOULD be removed or made to refuse use with a store that has leases. A store without `+leases()+` is allowed: builds are then never adopted.
+
 === Routing and change propagation
 
 * *Routing.* `+XmlFile.read+`, `+unmarshal+`, `+write+`, `+exists+`, `+delete+` and the raw-read methods route to the store when the store owns the key.
-** Each `+XmlFile+` remembers the version it last loaded, and a write expects that version.
+** The controller keeps a table with the version it last loaded or wrote of each key. Every `+XmlFile+` for that key shares the entry, and a write expects that version.
 ** Raw reads (REST `+config.xml+`, `+getFile()+` snapshots) only look; they do not move the version.
 ** `+getFile()+` materialises a local copy for code that needs a `+File+`. A plugin that writes the copy with its own writer has the change written back to the store, merged against the content the copy was made from: at the next `+getFile()+`, and every minute.
 * *`+ItemChangeApplier+`* subscribes to the store and applies other controllers' changes in memory:
@@ -79,14 +93,15 @@ An SPI for storing what Jenkins writes to `+JENKINS_HOME+` (item, global, descri
 ** a change to an item's sub-items (promoted-builds' `+promotions/*/config.xml+`, matrix-project's `+configurations/**/config.xml+`) reloads the item; their directories are created when the item loads, since their owners find them by listing
 ** a change that fails to apply is retried with backoff
 * *Concurrent writes.*
-** A compare-and-set conflict is resolved by a three-way XML merge (`+XmlMerge+`): base = what this controller last loaded, theirs = the store, mine = this save. The merge recurses into distinctly named parts. A part changed on both sides keeps this controller's value, and the conflict is counted.
-** The object is then reloaded with both changes.
+** A compare-and-set conflict is resolved by a three-way XML merge (`+XmlMerge+`): base = what this controller last loaded, theirs = the store, mine = this save. The merge recurses into distinctly named parts. The merge applies this controller's change on top of the stored version if the two sides changed different parts.
+** A merge that is not safe is not applied. It is not safe when the same part was changed on both sides, when there is no base, when the key was deleted meanwhile, or when the merge fails. The save is then refused, not written over the stored version, and the object is reloaded from the store. A web request sees the refusal as a conflict (a form shows it, a `+config.xml+` upload gets an error), so the user reloads and redoes the change; a background save is logged and counted. A save never overwrites a change made elsewhere.
+** Merging recurses by element name, and all the children of one name are one part, so a list is a unit. Two administrators each adding a credential on different controllers at the same moment have changed the same list in `+credentials.xml+`: the second save is refused and the object reloaded, it is not merged and not lost silently.
+** The object is reloaded with both changes after a clean merge.
 ** Objects are snapshotted on save and on reload, so a pending save is never overwritten by a reload.
 ** A merge whose result is what is stored already writes nothing; the object then keeps the version and base it read before, so its next save merges again rather than overwriting.
-** *Policy* (`+PersistenceStores.conflicts+`): `+warn+` (the default) merges as above; `+fail+` refuses every conflicting save; `+strict-ui+` refuses only a save made by a web request (a form, a `+config.xml+` upload) that changed the same part as the change made meanwhile, or cannot be merged, so the user reloads instead of silently overwriting someone else's change. An administrative monitor shows the conflict count.
+** *Policy* (`+PersistenceStores.conflicts+`): no value makes a conflicting save overwrite. `+fail+` refuses every conflicting save without trying to merge. An administrative monitor shows how many saves were refused.
 * *Keys created at runtime* (`+secrets/*+`) are shared. The first controller to create one decides its value, through a create-only write. Each controller keeps a local copy of every shared key from startup.
 * *No-op writes* (content unchanged) create no version and no event.
-* *The `+DoubleLaunchChecker+`* is disabled while a store is in use.
 
 === What stays local
 
@@ -122,11 +137,19 @@ Workspaces, caches, `+plugins/+`, `+war/+`, logs of Jenkins itself, per-controll
 
 * Encryption at rest is the backend's job; envelope or KMS encryption is a follow-up. The store holds the same data as the home, so access to the store is equivalent to access to `+JENKINS_HOME+`.
 * Secrets stay encrypted with the shared master key, exactly as on disk.
+* *Trust model.* The controllers of a cluster are one trust domain. A controller applies what it reads from the store without further checks, and the store holds serialised configuration, queue items with their authentication, and messages to running builds (JEP-253). Write access to the store is therefore code execution on every controller and administrator access to the whole cluster. The store's credentials are given only to controllers, and the database and blob storage are not reachable by anything else.
+* *Traffic.* Connections to the store SHOULD use TLS. Traffic between controllers (JEP-254) carries users' credentials and SHOULD use TLS too (a service mesh, or an HTTPS internal URL).
 * A security review of the cross-controller interfaces is pending, through a separate process.
 
 == Infrastructure Requirements
 
-There are no new infrastructure requirements related to this proposal.
+There are no new infrastructure requirements for Jenkins core. A deployment needs the stores of JEP-255. The reference backend's tests run PostgreSQL in Docker (Testcontainers), and the acceptance scripts need Docker; see JEP-255 for where the plugins, the chart and the scripts are hosted.
+
+== Open questions
+
+* This JEP is too large for one review and will be split: the SPI, `+XmlFile+` routing and what stays local; applying changes from other controllers and the conflict policy; and `+Item.getItemUuid()+` and `+ItemFiles+`. The text above will be redistributed, and this section updated, when the split is made. JEP-255 will be split too.
+* The architecture is being redesigned so that more of the cluster engines live in the cluster plugin behind core extension points. The SPI above may change with it.
+* Item identity: key build data (blobs, records, placeholders, leases) by `+Item.getItemUuid()+` instead of by path.
 
 == Testing
 
@@ -144,9 +167,9 @@ There are no new infrastructure requirements related to this proposal.
 * *Core:* prototype branches of Jenkins core, `+cnj/t1-*+`, `+cnj/t6-*+`, `+cnj/t11-m1-xml-merge+` and `+cnj/t15-remaining+`.
 * *cloudbees-folder:* prototype branches `+cnj/t1-m2-folder-children+`, `+cnj/t15-remote-child+`.
 * *Cluster plugins:* link:https://github.com/timja/cluster-plugin[timja/cluster-plugin] (until the prototype's Target 15 one plugin, `+persistence-store-postgresql+`).
-* *Findings:* documents in the timja/cloud-native-jenkins repository (the prototype's notes and findings): `+findings/ET1-shared-items.md+`, `+ET6-static-state.md+` and `+ET11-cross-cutting.md+`.
+* *Evidence:* the acceptance scripts named under Testing print the measurements quoted in this JEP. The prototype's write-ups of those runs are available on request.
 
 == References
 
 * link:https://www.jenkins.io/doc/book/using/pluggable-storage/[Pluggable storage], and JEP-202, 207, 210, 212, 213, 226
-* `+ROADMAP.md+` in the timja/cloud-native-jenkins repository (the prototype's notes and findings): the sections on item configuration changed at runtime and on static state in the store
+* The prototype's notes on the experiments summarised under Motivation are available on request.

@@ -40,6 +40,7 @@ endif::[]
 == Abstract
 
 A plugin installed, upgraded, uninstalled, disabled or enabled on one controller is applied to every controller of the cluster, and to any controller that later starts with an empty home.
+
 * New plugins load live where they support it.
 * Other changes are applied by rolling safe restarts, one controller at a time. Pipelines pause at a save point and resume.
 
@@ -109,14 +110,18 @@ Found by hand on a cluster: a plugin installed from the Plugins page went to one
 
 * Without a store, nothing changes.
 * With one, the Plugins page works as on one controller, apart from the refusals above.
+* *Mixed versions during a roll: limitation.* While controllers are being restarted one at a time, some run the old version of a plugin and some the new. Compatibility is guaranteed only for the store protocol and schema, not for the serialised shape of a plugin's data: an old controller that saves an object drops fields it does not know, and the new controller reloads it without them; renamed elements make both sides' saves look like changes. Configuration changes should not be made during a roll. The details are in JEP-255.
+* *Rollback.* A plugin downgrade is refused, and the overlay never installs an older version over a newer one, so a plugin upgrade cannot be undone through the plugin manager. An administrator can uninstall or disable the plugin, which is itself a rolling change. Returning to the earlier version means restoring the store from a backup taken before the upgrade and starting an image with the earlier plugin set (JEP-255, Rollback), since data may already have been saved in the newer shape.
 
 == Security
 
 Plugin changes still need `+Overall/Administer+`. Archives are verified by checksum before being installed elsewhere.
 
+The overlay and the archives are in the store and blob storage, which every controller trusts (JEP-250): write access to them is code execution on every controller, because a controller loads the plugin archives it finds there. The checksum protects against a corrupt archive, not against a writer to the store, who also writes the checksum.
+
 == Infrastructure Requirements
 
-There are no new infrastructure requirements related to this proposal.
+The infrastructure of JEP-255 (the stores, the plugin and chart repositories, Docker in CI). The acceptance scripts (ET13, ET19, ET21) also need a Kubernetes cluster (kind) and, for ET21, a browser (Playwright).
 
 == Testing
 
@@ -132,10 +137,9 @@ There are no new infrastructure requirements related to this proposal.
 
 == Prototype Implementation
 
-* *Cluster plugins* (link:https://github.com/timja/cluster-plugin[timja/cluster-plugin]) on prototype branch `+cnj/t13-m1-cluster-plugins+`: `+ClusterPlugins+`, `+ClusterUpdateCenterConfiguration+`, `+ClusterPluginSet+`; `+ClusterUpdateSites+` on `+cnj/t14-m1-resilience+`.
-* *Cluster plugins*, later: `+UpdateCenterRouting+`, `+ClusterPluginManagerNotice+`, `+ClusterCliPlugins+`, `+MemberStatus+` on `+cnj/t15-remaining+`.
+* *Cluster plugins* (link:https://github.com/timja/cluster-plugin[timja/cluster-plugin], branch `+main+`): `+ClusterPlugins+`, `+ClusterUpdateCenterConfiguration+`, `+ClusterPluginSet+`, `+ClusterUpdateSites+`, `+UpdateCenterRouting+`, `+ClusterPluginManagerNotice+`, `+ClusterCliPlugins+` and `+MemberStatus+`.
 * *Core:* the restart reclaim on prototype branch `+cnj/t12-m1-remainder+` of Jenkins core; the notices hook and `+PluginArchiveListener+` on `+cnj/t15-remaining+`.
-* *Findings:* `+findings/ET13-cluster-plugins.md+` and `+ET19-plugin-manager.md+`, a document in the timja/cloud-native-jenkins repository (the prototype's notes and findings).
+* *Evidence:* the acceptance scripts named under Testing print the measurements quoted in this JEP. The prototype's write-ups of those runs are available on request.
 
 == References
 

@@ -40,6 +40,7 @@ endif::[]
 == Abstract
 
 Completed builds are published to the shared store, so every controller shows the full history of every job, whichever controller ran each build:
+
 * the build's record (`+build.xml+`) goes to the persistence store
 * a snapshot of its directory goes to blob storage
 * a Pipeline's log goes to external log storage (JEP-210), written while the build runs
@@ -71,15 +72,17 @@ Builds are materialised locally only when something reads them. Builds still run
 === Logs
 
 Pipeline logs use the existing external log storage API (JEP-210, `+LogStorageFactory+`), so any implementation can serve a cluster, for example blobs (the reference implementation below) or CloudWatch Logs (pipeline-cloudwatch-logs). This JEP adds no log API. It states what an implementation must do for a cluster:
-* *Readable from every controller*, while the build runs and after, through `+LogStorageFactory.forBuild+` on any controller. The console of a running build is also forwarded to its owner (JEP-254).
-* *Keyed by the build, not by the controller* (for example job full name and build number), so a controller adopting a build continues the same log.
-* *Durable at save points.* Everything written before a Pipeline save point is stored before the save point is (JEP-252). A controller resuming from it then continues the log where the save point left off, with no lines missing or repeated. The prototype makes the save point wait through workflow-cps' `+ProgramSavedListener+`. An implementation that buffers asynchronously (CloudWatch batches) must flush there. That hook is the one API addition logs need, and it belongs to JEP-252.
-* *Fenced.* A controller that may have lost the build's lease stops writing (JEP-252). A store accepting writes from two controllers (CloudWatch does) relies on this.
-* *Moved with the job* on a rename, or keyed so it need not move (as on a single controller).
+
+* *Readable from every controller* (MUST), while the build runs and after, through `+LogStorageFactory.forBuild+` on any controller. The console of a running build is also forwarded to its owner (JEP-254).
+* *Keyed by the build, not by the controller* (MUST), for example job full name and build number, so a controller adopting a build continues the same log.
+* *Durable at save points* (MUST). Everything written before a Pipeline save point MUST be stored before the save point is (JEP-252). A controller resuming from it then continues the log where the save point left off, with no lines missing or repeated. The prototype makes the save point wait through workflow-cps' `+ProgramSavedListener+`. An implementation that buffers asynchronously (CloudWatch batches) MUST flush there. That hook is the one API addition logs need, and it belongs to JEP-252.
+* *Fenced by the log store* (MUST). An append states the length its writer knows the log to have, and the store MUST refuse it unless the log is exactly that length. The refusal MUST be decided by the store as part of the write (a conditional write), not from a controller's cache of where the log ends or a listing followed by a write: a controller that was paused and lost the build's lease can otherwise append at an offset the new owner has already used. Two appends at the same offset MUST NOT both succeed. A controller that may have lost the build's lease also stops writing (JEP-252), but that is the second line of defence. A store accepting writes from two controllers (CloudWatch does) relies on this.
+* *Moved with the job* on a rename (SHOULD), or keyed so it need not move (as on a single controller).
 
 *Reference implementation* (`+cluster+` plugin, `+BlobLogStorage+`, over the blob store plugin's `+LogBlobs+`):
+
 * The build writes its local `+log+` and `+log-index+`. A shipper appends what is new to the stored log: when 32 KiB is pending, 3 s after the last shipment, before each save point and at the end of the build.
-* *How a log is stored is up to the blob store plugin.* An append states the length its writer knows the log to be, and is refused if the log is longer.
+* *How a log is stored is up to the blob store plugin.* An append states the length its writer knows the log to be, and is refused unless the log is exactly that length.
 ** *Azure Blob Storage* (`+cluster-azure-blob+`): append blobs. An append blob takes at most 50,000 blocks, so a log is stored as `+log+`, `+log.1+`, …. A new segment starts before the limit, and readers concatenate them.
 ** *S3* (`+cluster-s3+`), and any blob store without appendable blobs (`+ChunkedLogBlobs+`): each append is an object of its own, `+log.d/<offset>.<length>+`, and when the build completes they are put together into `+log+`. A reader takes `+log+` if it is there, then the chunks beyond its end, so it reads the whole log whatever an interrupted compaction left.
 * The shipper checks ownership and pauses while this controller's membership may have lapsed. A new owner continues where the blobs end.
@@ -91,7 +94,7 @@ Pipeline logs use the existing external log storage API (JEP-210, `+LogStorageFa
 * Each running build has a placeholder `+jobs/<job>/running/<N>.xml+`, holding its owner, start time and save point (JEP-252).
 * On other controllers, the job page lists placeholders under "Running on other controllers".
 * The Builds card shows them above local builds, with a stop button, and the job's icon animates.
-* In the REST API, `+builds+`, `+allBuilds+` and `+lastBuild+` include them as a stand-in with a `+Run+`'s properties (`+number+`, `+url+`, `+building+`, `+timestamp+`, `+result+`, …). Their own URLs are answered by their owner.
+* In the REST API they are a separate property of the job, `+buildsElsewhere+`, with a stand-in for each build carrying a `+Run+`'s properties (`+number+`, `+url+`, `+building+`, `+timestamp+`, `+result+`, …). `+builds+`, `+allBuilds+` and `+lastBuild+` keep their types and list only builds this controller has. A stand-in's own URL is answered by its owner.
 * `+/job/x/lastBuild/…+` redirects to the newest build when that build runs elsewhere.
 
 === History at scale
@@ -117,6 +120,7 @@ Pipeline logs use the existing external log storage API (JEP-210, `+LogStorageFa
 == Backwards Compatibility
 
 * Without a store, nothing changes.
+* *Known gap in the prototype:* its S3 chunked log (names chunks by offset and length, with a controller-local record of the end) and its Azure segment rollover do not yet meet the fencing requirement for a paused former owner. The requirement above is the specification; the prototype will be changed to meet it.
 * With one, plugins reading the build directory see a complete directory once the build is loaded.
 * Plugins writing to a completed build's directory have their files republished, within a minute during the first hour after completion, and within 10 minutes later.
 * Plugins keeping data keyed by job *name* outside `+JENKINS_HOME+` can key it by `+Item.getItemUuid()+` instead (JEP-250), which a rename does not change.
@@ -145,7 +149,7 @@ There are no new infrastructure requirements related to this proposal.
 * *Core:* prototype branches of Jenkins core, `+cnj/t3-*+`, `+cnj/t8-*+`, `+cnj/t12-m1-remainder+`, `+cnj/t14-m1-resilience+` and `+cnj/t15-remaining+`.
 * *junit-sql-storage:* prototype branches `+cnj/t3-m5-remote-delete+`, `+cnj/t15-follow-renames+`.
 * *Cluster plugins* (link:https://github.com/timja/cluster-plugin[timja/cluster-plugin]): `+BuildRecords+` publication hooks, `+BlobLogStorage+`, `+ClusterFingerprintStorage+`, `+ClusterView+`.
-* *Findings:* documents in the timja/cloud-native-jenkins repository (the prototype's notes and findings): `+findings/ET3-build-records.md+`, `+ET8-history.md+`, `+ET12-remainder.md+` and `+ET15-logs-api-failover.md+`.
+* *Evidence:* the acceptance scripts named under Testing print the measurements quoted in this JEP. The prototype's write-ups of those runs are available on request.
 
 == References
 

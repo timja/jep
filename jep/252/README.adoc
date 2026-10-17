@@ -48,15 +48,19 @@ Every running build has exactly one owner: the controller holding its lease. A P
 * *Placeholders.* `+RunningBuilds+` writes a placeholder `+jobs/<job>/running/<N>.xml+` when a build starts. It records the owner's origin and name, the start time, the lease epoch, and properties such as the latest save point. It is removed after the build's record is published (JEP-251).
 * *Updates merge and are serialised per build.* A placeholder update adds its properties to those already recorded (a save point's commit keeps the result, and the other way round), and a controller makes one build's updates one at a time. Concurrent updates from the same owner would otherwise race on the compare-and-set, and the owner would mistake its own write for an adoption and stop the build.
 * *A finished build records its result in the placeholder* before its record is published. If its controller dies in between, the sweep closes the build with that result, not as ABORTED.
-* *`+BuildLeases+`* (a store facet):
-** `+acquire(key)+` returns an epoch, and succeeds only if the lease is free or its holder is no longer a live member
-** `+holds(key, epoch)+`
-** `+release(key, epoch)+`
+* *`+BuildLeases+`* (a store facet) has this contract, in the sense of RFC 2119:
+
+** `+acquire(key)+` MUST return a new epoch, higher than any returned before for that key, and MUST succeed only if the lease is free, or its holder is no longer a live member, or this origin holds it already (then the epoch is unchanged). It returns 0 if another live origin holds it. Of two concurrent callers, at most one succeeds.
+** `+holds(key, epoch)+` MUST answer true while this origin holds the lease with that epoch. It MUST answer false only on evidence from the store that the lease is gone or taken. When the store cannot be reached or cannot tell, it MUST throw `+IOException+`, never answer false: a false answer interrupts the build, and an outage of the whole store would then abort every running build in the cluster. (A self-fence on missing evidence is a separate, bounded mechanism; see Known limitations.)
+** `+release(key, epoch)+` MUST release the lease only if held with that epoch.
+** A lease lapses when its holder stops being a live member as the store judges it (for example by heartbeats on the database's clock), never by the holder's own clock.
+** `+PersistenceStore.writeIfHeld(leaseKey, epoch, key, content, expectedVersion)+` MUST check the lease and write in one atomic step, and throw `+LeaseLostException+` if the lease is not held with that epoch. It is how a build's record is published: a controller that lost the build cannot write its record over the new owner's, even if it was paused between checking and writing. A check followed by a separate write does not meet this contract.
 * *Fencing.* Every placeholder update is a compare-and-set on the placeholder as the owner last wrote it, and fails if another controller adopted the build. A controller checks its leases:
 ** periodically
 ** whenever its membership may have lapsed (heartbeats missing for longer than the member timeout)
 +
 On evidence from the store that a lease is lost, it stops the build locally (`+lost+`) and never publishes it.
+
 * *No fencing on missing evidence.* If the store cannot be reached, a lease's state is unknown. The build carries on, while its log and save points wait until the heartbeat is back. This includes an owner that alone lost the database: after the member timeout another controller adopts its builds while it carries on. Until it reaches the store again and finds its lease lost, both run the build's steps; only publication is fenced. Steps with external side effects can therefore run twice, as after an adoption (Backwards Compatibility).
 
 === Save points (Pipelines)
@@ -77,7 +81,7 @@ On evidence from the store that a lease is lost, it stops the build locally (`+l
 * *What else happens on adoption:*
 ** A stop request made while the owner was gone is honoured.
 ** `+input+` steps, `+lock+`, `+milestone+` and the build's place in the shared queue carry over (JEP-253).
-* *Workspaces.* A workspace is on the agent, not the controller, so an adopted build finds what its earlier stages left there as long as the agent survives: a static or inbound agent reconnects to the adopting controller (agents follow the build's lease), and a later stage reads the files an earlier stage wrote. A Kubernetes pod agent belongs to the controller that started it and goes with it; the adopted build's `+node+` block is retried on a new pod with an empty workspace. Files a later stage needs from such a pod must be carried with `+stash+`/`+unstash+` or archived, through an artifact manager that keeps them in shared storage (JEP-202).
+* *Workspaces.* A workspace is on the agent, not the controller, so an adopted build finds what its earlier stages left there as long as the agent survives: a static or inbound agent connects to whichever controller answers it (JEP-254), and a later stage reads the files an earlier stage wrote. A Kubernetes pod agent belongs to the controller that started it and goes with it; the adopted build's `+node+` block is retried on a new pod with an empty workspace. Files a later stage needs from such a pod must be carried with `+stash+`/`+unstash+` or archived, through an artifact manager that keeps them in shared storage (JEP-202).
 * *Builds nothing can resume* (freestyle, `+PERFORMANCE_OPTIMIZED+`, or a save point that cannot be found) are closed as ABORTED: a minimal record, with a console saying why, after what the build had printed (shipped while it ran, JEP-251). This also covers builds that were running when a backup was taken, after a restore.
 * *No takeovers right after an outage.* A controller only takes others for gone after its own heartbeats have reached the database without a gap for longer than the member timeout. Right after a database outage, every heartbeat is stale, the live controllers' included.
 
@@ -91,6 +95,7 @@ On evidence from the store that a lease is lost, it stops the build locally (`+l
 . the target takes the build over and resumes it, where the `+node+` step gets an executor
 +
 A build is handed over only while it holds no other executor, so nested or parallel `+node+` blocks for labels on different controllers wait instead of moving back and forth; a build is handed over at most four times. Running a `+node+` block on another controller's agent without moving the build would mean relaying Remoting between JVMs, which this JEP does not attempt.
+
 * *Safe restarts* pause Pipelines at a save point (they resume afterwards, here or elsewhere) and wait for builds that cannot survive a restart, as on one controller.
 
 == Motivation
@@ -119,6 +124,7 @@ A build is handed over only while it holds no other executor, so nested or paral
 
 * Adoption runs the build as it was configured, with the same authorization (`+QueueItemAuthenticator+`) as on its original controller.
 * Save points have the same content as the build's `+program.dat+` and flow nodes.
+* An adopting controller trusts the placeholder, save point and authentication it reads from the store; see the trust model in JEP-250.
 
 == Infrastructure Requirements
 
@@ -141,9 +147,9 @@ There are no new infrastructure requirements related to this proposal.
 * *Core:* prototype branches of Jenkins core, `+cnj/t4-*+`, `+cnj/t12-m1-remainder+`, `+cnj/t14-m1-resilience+`, `+cnj/t15-remaining+`.
 * *workflow-cps:* prototype branch `+cnj/t4-m1-program-saved-listener+`.
 * *Cluster plugins* (link:https://github.com/timja/cluster-plugin[timja/cluster-plugin]): `+SavePoints+`, `+PipelineAdopter+`, `+Handover+`.
-* *Findings:* documents in the timja/cloud-native-jenkins repository (the prototype's notes and findings): `+findings/ET4-pipeline-failover.md+`, `+ET12-remainder.md+`, `+ET13-cluster-plugins.md+`, `+ET14-store-outage.md+` and `+ET15-logs-api-failover.md+`.
+* *Evidence:* the acceptance scripts named under Testing print the measurements quoted in this JEP. The prototype's write-ups of those runs are available on request.
 
 == References
 
-* `+findings/E4-pipeline-failover.md+` in the timja/cloud-native-jenkins repository (the prototype's notes and findings): cold failover of running Pipelines through a shared home
+* The prototype's notes on the experiments summarised under Motivation are available on request.
 * link:https://www.jenkins.io/doc/book/pipeline/scaling-pipeline/[Pipeline durability settings]

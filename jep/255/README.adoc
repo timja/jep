@@ -25,7 +25,7 @@ endif::[]
 | Not Submitted :information_source:
 
 | Type
-| Process / Standards
+| Standards
 
 | Created
 | 2026-10-11
@@ -40,6 +40,7 @@ endif::[]
 == Abstract
 
 How controllers know about each other, and how the cluster behaves when its shared services fail. Also how a cluster is installed, upgraded, migrated to, backed up and restored:
+
 * *Membership:* heartbeats with versions and protocol numbers, and a database session lock per controller, so the death of a controller's process is noticed in seconds.
 * *Resilience:* pooled database connections with timeouts; failing fast while the store is unreachable; no takeovers after an outage; waiting for the store at boot.
 * *Operations:* a Helm chart; rolling upgrades with mixed versions; schema migrations that do not block the cluster; importing a file-based home; backup, restore and point-in-time recovery.
@@ -49,30 +50,35 @@ How controllers know about each other, and how the cluster behaves when its shar
 === Joining and leaving
 
 There is no join step: no token, UI, CLI or API to add a controller. A controller is a member because it is configured for the cluster's stores, and it stops being one when it stops heartbeating. Adding a controller means starting another one with the same configuration (in Kubernetes, raising the StatefulSet's replicas). What a controller needs:
+
 * *The stores:* the database's JDBC URL and credentials (`+CLUSTER_POSTGRES_URL+`, `+CLUSTER_POSTGRES_USER+`, `+CLUSTER_POSTGRES_PASSWORD+`) and the blob store's (Azure: `+CLUSTER_AZURE_BLOB_CONNECTION_STRING+`, `+CLUSTER_AZURE_BLOB_CONTAINER+`; S3: `+CLUSTER_S3_BUCKET+`, `+CLUSTER_S3_PREFIX+`, `+CLUSTER_S3_REGION+`, `+CLUSTER_S3_ENDPOINT+`, `+CLUSTER_S3_PATH_STYLE+`, with credentials from the AWS default chain). Access to these is what makes a controller part of the cluster.
 * *The cluster's key material:* `+secret.key+`, `+secrets/+` and the instance identity, generated once for the cluster and given to every controller (the chart's `+make-seed-secret.sh+` creates it as a Kubernetes Secret; the entrypoint copies it into an empty home). Keys created later at runtime are in the store (JEP-250). A controller started without this seed would create keys of its own and could not read the cluster's secrets, so it refuses to start: the first controller stores a check value encrypted with the cluster's key, and a controller that cannot decrypt it stops, saying why (`+KeyCheck.skip=true+` turns the check off).
 * *An identity:* a name unique among the live controllers (`+JENKINS_CLUSTER_NAME+`, by default the host name, such as the pod name) and an internal URL other controllers can reach it at (`+JENKINS_CLUSTER_INTERNAL_URL+`, JEP-254).
 * *A compatible version:* the controller image, of the same or an adjacent version (rolling upgrades are supported, see below). Plugins added at runtime are applied from the cluster's plugin set (JEP-256).
 
 On start, a controller:
+
 . waits for both stores (see Resilience below)
+. creates or migrates the schema, under a lock, if it is the first of a new version (see Schema migrations below). The reference backend does this when it opens its connection
 . checks that it has the cluster's key material (see above)
-. creates or migrates the schema, under a lock, if it is the first of a new version (see Schema migrations below)
-. refuses to start if a live peer speaks a protocol older than its `+minimumPeerProtocol+`, or if its own protocol is below the cluster's protocol floor
 . registers itself with its first heartbeat
+. refuses to start if a live peer speaks a protocol older than its `+minimumPeerProtocol+`, or if its own protocol is below the cluster's protocol floor
 . catches up: items, static configuration, build history and the plugin set are read from the stores, and update-site data is taken from the cluster
-. starts serving. Readiness probes and load balancers send it requests once it answers.
+. is marked ready once its items are loaded, and starts serving. Readiness probes and load balancers send it requests once it answers.
+
+A controller that fails any of these steps, or fails later during start, closes its connections and removes its row, so a controller that refused to start is not left as a member. Until it is ready, a member is alive but is not given triggers or queue work (JEP-253); in the members table its row says that it is not ready.
 
 It leaves by stopping, cleanly (its row is deleted, and the others react at once) or not (its heartbeat expires). Its running builds are adopted (JEP-252). The cluster view (Manage Jenkins > Cluster) shows the members, read-only.
 
 === Membership
 
-* *Heartbeats.* Each controller heartbeats every 2 s into a members table. A row holds its origin (a new one per start), name, internal URL, core and plugin version, cluster protocol number, applied plugin-set generation (JEP-256), and a status document: busy and total executors (its own and its agents'), its share of the queue, and plugin installs in progress or failed. The cluster view shows these.
+* *Heartbeats.* Each controller heartbeats every 2 s into a members table. A row holds its origin (a new one per start), name, internal URL, core and plugin version, cluster protocol number, applied plugin-set generation (JEP-256), whether it is ready, and a status document: busy and total executors (its own and its agents'), its share of the queue, and plugin installs in progress or failed. The cluster view shows these.
 * *Liveness.* A member is alive while its last heartbeat is younger than the member timeout (15 s), or, sooner, until its session lock is free:
 ** *Session lock.* Each controller holds a Postgres session advisory lock, on a connection of its own, for as long as it runs. The database frees it as soon as that connection closes, so when a controller's process dies (a crash, `+SIGKILL+`, an OOM kill) the others see it gone at their next heartbeat, without waiting for the timeout. A paused or partitioned controller keeps its connection, and its lock, so it is waited for until the timeout as before: nothing is taken from a controller that may still be working. The lock needs a direct connection; behind a pooler in transaction mode (PgBouncer), which does not keep sessions, it is turned off (`+sessionLocks=false+`) and liveness is the heartbeat alone.
 ** *Deadlines.* Each controller watches the earliest deadline among its peers (their last heartbeat plus the timeout) rather than checking on a fixed tick.
 ** A cleanly stopped controller deletes its row and announces it (`+NOTIFY+`), so others react at once.
 ** Rows dead for a day are pruned, and so are the per-controller counters they held.
+* *Clock skew.* Liveness uses the database's clock only: a heartbeat is stamped with the database's time when it is written, and judged against the database's time when it is read. A controller's own clock does not decide whether it or a peer is alive, so skew between controllers cannot cause or prevent a takeover. Controller clocks matter for the minute a cron tick is labelled with (a controller ahead claims a tick early; one behind finds it already claimed and skips it, so no tick runs twice), for the expiry of remember-me cookies, and for the expiry of queue reservations. Controllers SHOULD keep their clocks within a few seconds of each other (NTP).
 * *Leaving.* When a controller leaves, the others sweep its builds and queue items right away (JEP-252, JEP-253). Measured: the builds of a controller killed with `+SIGKILL+` were adopted 5.0–6.3 s later, and those of one stopped cleanly 6.5 s later. A controller paused for 12 s lost nothing.
 * *Protocol versions.* `+minimumPeerProtocol+` makes a new version refuse to start while older peers are alive, for changes that cannot coexist. The other way round, a Contract step (below) records the protocol it needed as the cluster's floor, in the database; a controller speaking an older protocol then refuses to start, whatever its own minimum.
 
@@ -83,6 +89,7 @@ It leaves by stopping, cleanly (its row is deleted, and the others react at once
 ** one for heartbeats, leases and membership, so a busy work pool never makes a controller look gone
 +
 Every connection has socket, connect, statement and lock timeouts and TCP keepalive. A call is retried on another connection only if the connection broke before the commit was sent, so no work is done twice.
+
 * *Fail fast.* While the database is unreachable, ordinary store calls fail at once for 5 s at a time, instead of each waiting out the timeouts. The heartbeat keeps probing and closes the breaker when it gets through.
 * *What controllers do meanwhile:*
 ** Pages answer, without data from the store, and a key never used before is temporary.
@@ -102,6 +109,7 @@ Every connection has socket, connect, statement and lock timeouts and TCP keepal
 === Schema migrations
 
 Schema changes must not stop a running cluster, and old and new controllers run side by side during a rolling upgrade. Migrations go in three steps, tracked in a `+jenkins_schema_migrations+` table and shown in the cluster view:
+
 * *Expand*, at startup, in the schema transaction: only changes that take no time, such as nullable columns. Indexes are built with `+create index concurrently+`, outside the transaction, so writes go on.
 * *Backfill*, in the background: batches of rows (1,000 by default), each in a transaction that also records a cursor. One controller does it at a time, and another takes over, from the cursor, if that one leaves. New code writes the new form itself, so the backfill only covers rows written before.
 * *Contract*, once the backfill is done and no live controller speaks an older protocol than the migration needs: in one transaction, it first converts the rows older controllers wrote in the old form after the backfill had passed them, then enforces the new constraints. From then on that protocol is the cluster's floor.
@@ -124,6 +132,12 @@ Schema changes must not stop a running cluster, and old and new controllers run 
 ** pod management `+Parallel+`, so a scale-up or a restart of all pods does not wait for each pod to be ready in turn
 * *No persistent volumes for controllers.* `+JENKINS_HOME+` is a cache: everything that must survive is in the stores, and an empty home is rebuilt from them at start (JEP-250, JEP-251). So the chart uses `+emptyDir+`, which survives a container restart (a safe restart, or a crash) but not a rescheduled pod. Persistent volumes would make failover worse: a volume that can be attached to one node at a time keeps a replacement pod waiting while it detaches from a dead node (minutes, typically), and binds pods to the volume's zone. What a fresh home costs is the start. Measured on a laptop (Docker, 8 CPUs), with every plugin in the image and 2,000 jobs and 2,000 builds in the stores, a controller replaced by a fresh one (empty home) served the API 12.8–20.4 s after its container started (median 16.4 s over three runs: 2.6–4.9 s to start the container and JVM, 7–11 s of Jenkins initialization); its first full page of 2,000 jobs took 5–19 s more, then 0.6 s. Builds are fetched only when first looked at. With a plugin installed at runtime as well, which that measurement's fresh controller fetched from blob storage and loaded live once up, it served the API after 12.9 s: no slower. A fresh controller now fetches such plugins before it loads anything and restarts once (JEP-256), which adds a JVM start; that has not been measured. To start faster, put plugins in the image rather than installing them at runtime, and size `+emptyDir+` (or `+medium: Memory+`) for the builds people look at.
 * *Rolling upgrade.* `+helm upgrade+` to a new image replaces controllers one at a time. Running Pipelines are adopted by the controllers still up, and mixed versions coexist within one protocol number.
+* *Mixed versions: limitation.* Compatibility during a roll is guaranteed for the store protocol and the schema (Expand, Backfill, Contract above), not for the shape of serialised objects. If a new version of core or of a plugin adds a field, and a controller still running the old version saves the same object, the old controller writes it without the field, and the new controller then reloads it with the field removed (a reload clears the fields the stored form lacks). A `+readResolve+` that renames elements has the same effect in both directions, and each side's save then looks like a change to the other's. The three-way merge sees changes on both sides, and a save may be refused and reloaded (JEP-250). The same applies to a core upgrade and to a plugin roll (JEP-256). Changes to configuration SHOULD NOT be made while a roll is in progress, and JCasC is applied by the controller that starts, so the new version's fields can be lost again by an old controller that saves afterwards.
+* *Rollback.*
+** *Before Contract* of the new version's migrations, deploying the previous image (a rolling upgrade in the other direction) restores the previous version; the schema is a superset of both.
+** *After Contract*, the protocol it needed is the cluster's floor, so an image with an older protocol refuses to start. The way back is to restore the database and blob container from a backup taken before the upgrade (below), into a new namespace, and start the previous image on it. Builds that ran after the backup are lost.
+** *Plugins:* a plugin downgrade is refused (JEP-256). Going back to an older plugin set means deploying an image with the older set and a store restored to before the change.
+** Contract runs once the backfill is done and no live controller speaks an older protocol than it needs, which is shortly after a roll finishes, so the window for rolling back by image is short. Whether Contract should wait for an operator or a grace period is an open question.
 * *Import.* A file-based home is imported by starting one controller on it with `+importHome=true+`. Configuration, users, credentials, nodes, builds, logs and fingerprints are uploaded, keys already present are kept, and a report is written. Importing again imports nothing.
 * *Backup and restore.*
 ** `+scripts/backup.sh+` does a `+pg_dump+` and then copies the blob container; `+scripts/restore.sh+` restores into a new namespace. The backup is consistent when no controller is running (scale the StatefulSet to 0 first). Taken while controllers run, it can restore records of builds deleted or republished during the copy with their files missing or newer. For an online backup, use point-in-time recovery (below).
@@ -156,10 +170,23 @@ Schema changes must not stop a running cluster, and old and new controllers run 
 
 * The store and blob credentials come from Secrets, and connections can use TLS through the JDBC URL and connection string.
 * The internal URLs used between controllers must stay inside the cluster network (JEP-254).
+* *Trust model.* The controllers are one trust domain, and the stores are inside it: write access to the database or the blob container is code execution on every controller (JEP-250). Network access to the stores and to the controllers' internal URLs is limited to the controllers.
+* Connections to the stores SHOULD use TLS (above), and so SHOULD the traffic between controllers.
 
 == Infrastructure Requirements
 
-There are no new infrastructure requirements related to this proposal.
+This proposal needs:
+
+* a PostgreSQL database (a managed service or in-chart for development) and a blob store (Azure Blob Storage or S3) per cluster, plus an artifact manager (JEP-202) in shared storage
+* repositories to host the plugins (`+cluster+`, `+cluster-postgresql+`, `+cluster-azure-blob+`, `+cluster-s3+`), and a place for the Helm chart; where they will live in the Jenkins organisation is not decided
+* Docker in the plugins' CI, since their tests run PostgreSQL, Azurite and an S3-compatible store in containers (Testcontainers)
+* a Kubernetes cluster (kind) to run the acceptance scripts, and a decision on who runs the scripts after the JEP is accepted and where they live (for example ATH, or a repository of their own)
+
+== Open questions
+
+* This JEP combines a standard (membership, liveness, protocol versions, schema migrations, outage behaviour) with an operations guide (the chart, import, backup and restore, point-in-time recovery). It will be split: the standard stays here, and the operations half becomes an Informational JEP or documentation with the chart. JEP-250 will be split too. Nothing is restructured in this version.
+* Should Contract of a migration be started by an operator, or wait for a grace period after a roll, so that rolling back by image stays possible for a time?
+* Outbound (SSH-launched) agents on shared nodes: see the open question in JEP-254.
 
 == Testing
 
@@ -178,7 +205,7 @@ There are no new infrastructure requirements related to this proposal.
 * *Cluster plugins* (link:https://github.com/timja/cluster-plugin[timja/cluster-plugin]): `+PostgresPersistenceStore+`, `+PostgresPersistenceStoreProvider+`, `+AzureBlobStore(Provider)+`, `+PeerVersionCheck+`, `+KeyCheck+`, `+SchemaMigrations+`, `+MemberStatus+`, `+HomeImporter+`, `+ClusterView+`.
 * *Core:* prototype branches of Jenkins core `+cnj/t14-m1-resilience+` (retries, temporary keys, `+sweepSoon+`) and `+cnj/t15-remaining+`.
 * *Chart:* `+charts/jenkins-cluster+` in link:https://github.com/timja/cluster-plugin[timja/cluster-plugin].
-* *Findings:* documents in the timja/cloud-native-jenkins repository (the prototype's notes and findings): `+findings/ET9-kubernetes.md+`, `+ET10-operations.md+`, `+ET14-store-outage.md+` and `+ET16-scale.md+`.
+* *Evidence:* the acceptance scripts named under Testing print the measurements quoted in this JEP. The prototype's write-ups of those runs are available on request.
 
 == References
 

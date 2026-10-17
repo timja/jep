@@ -40,6 +40,7 @@ endif::[]
 == Abstract
 
 Users and tools reach any controller through a load balancer with no stickiness. For that to work:
+
 * a browser stays signed in, and its forms keep working, on every controller
 * requests that only the owner of something can answer are forwarded to it: a running build's live console, `+input+`, stop and replay; an agent's pages, through the controller holding its channel; the UI fragments a page bound to objects in one controller's memory
 * builds running on another controller appear in every controller's UI and REST API
@@ -48,7 +49,9 @@ Users and tools reach any controller through a load balancer with no stickiness.
 
 === Sessions and crumbs
 
-* *Sign-in.* A browser's sign-in is a signed cookie (Jenkins' remember-me token, with the user's seed), valid on every controller, instead of a server-side HTTP session. Signing out, or changing the password, invalidates it everywhere.
+* *Sign-in.* A browser's sign-in is a signed cookie (Jenkins' remember-me token, with the user's seed), valid on every controller, instead of a server-side HTTP session. The chart sets `+TokenBasedRememberMeServices2.alwaysRemember+`, so every form sign-in issues the cookie, and the cookie is valid until its expiry (the remember-me validity) unless revoked.
+* *Signing out* ends the sign-in on every controller, the remember-me cookie included. Logging out writes a revocation entry for that login's token to the store, which every controller checks on each request, and which is kept until the token's own expiry and then removed. The user's other browsers stay signed in. (A mechanism that renews the user's seed would also end the sign-in everywhere, but would sign the user out of their other browsers; it is the fallback.) A copied cookie is therefore dead on all controllers once the user has signed out.
+* *Changing the password* renews the user's seed, which invalidates every sign-in of that user on every controller.
 * *Crumbs.* A cluster crumb issuer (`+crumbIssuer: cluster+`) binds crumbs to the sign-in cookie, or, before sign-in, to a nonce cookie. Every controller validates them with the same salt.
 * *API tokens* are stored with the user (JEP-250), so they work everywhere.
 
@@ -73,11 +76,11 @@ Users and tools reach any controller through a load balancer with no stickiness.
 === Agent channels
 
 * Each controller publishes which agents it holds a channel to.
-* Inbound agents reconnect to a failover URL (the load balancer) when their controller dies, and resume within about 40 s, as measured in the acceptance tests.
+* Inbound agents reconnect to a failover URL (the load balancer) when their controller dies, and resume within about 40 s, as measured in the acceptance tests. This requires the agent to be configured with the load balancer's URL, not a controller's.
 
 === Builds running elsewhere in the UI and REST
 
-See JEP-251: the job page, the Builds card, the job's icon, and REST `+builds+`, `+allBuilds+` and `+lastBuild+` all include them.
+See JEP-251: the job page, the Builds card and the job's icon show them, and the REST API lists them in the job's `+buildsElsewhere+` property (`+builds+`, `+allBuilds+` and `+lastBuild+` keep their types and list local builds only).
 
 == Motivation
 
@@ -94,18 +97,25 @@ See JEP-251: the job page, the Builds card, the job's icon, and REST `+builds+`,
 
 * Without a store, nothing changes.
 * *Known limitations:*
-** The REST stand-in for a build running elsewhere carries a `+Run+`'s properties, but its `+_class+` is the stand-in's. Deeper detail is at its own URL, which the owner answers.
 * *Password changes* sign out every browser of that user, including the one that made the change, as on one controller.
 
 == Security
 
 * Forwarded requests carry the user's credentials (cookies, `+Authorization+`), and the owner authorizes them as if received directly.
 * Controllers reach each other on internal URLs, which must not be reachable from outside the cluster network.
-* The trust model for requests between controllers is under security review, through a separate process.
+* *Trust model.* The controllers of a cluster are one trust domain (JEP-250). A forwarding controller can act as any user on any other controller, since it relays the user's cookie and `+Authorization+` header; a compromised controller is a compromised cluster.
+* *Internal traffic SHOULD use TLS.* Forwarded requests carry credentials, and the chart's example internal URL (`+http://$(POD_IP):8080/+`) is plain HTTP. TLS between controllers is a deployment concern (a service mesh, or `+JENKINS_CLUSTER_INTERNAL_URL=https://…+`).
+* The loop guard, the header `+X-Jenkins-Cluster-Forwarded-From+`, can be set by a client. It can only keep a request from being forwarded, which gives no privilege; it is not to be trusted.
+* *Sessions.* In cluster mode a sign-in is a bearer token valid until it expires or is revoked (above), instead of a server session that expires when idle.
+* A security review of the cross-controller interfaces is pending, through a separate process.
 
 == Infrastructure Requirements
 
-There are no new infrastructure requirements related to this proposal.
+A load balancer in front of the controllers, with no stickiness required, and the stores of JEP-255.
+
+== Open questions
+
+* *Outbound (SSH-launched) agents.* Static nodes are shared through the store (JEP-250), so every controller has a `+Computer+` for each of them, and each would launch an outbound agent. Core prevents the double launch only for cloud agents (`+Nodes.launchedElsewhere+` checks for `+AbstractCloudSlave+`), and the cluster plugin does not gate launchers. With three controllers and one SSH agent, three SSH sessions start three Remoting JVMs in the same remote root; the cluster sees three times the node's executors on one machine; and builds on different controllers use `+workspace/<job>+` on the same disk at once. Inbound agents are not affected, since they connect to one controller. Options under consideration: a launch lease per node, so one controller connects, the others show the computer as connected on that controller and forward its pages (as above), and the lease lapses with its holder so another launches; or a statement that version 1 supports inbound and cloud agents only and that an outbound launcher on a shared node is refused or warned about. No decision has been made.
 
 == Testing
 
@@ -124,8 +134,8 @@ There are no new infrastructure requirements related to this proposal.
 * *Core:* prototype branches of Jenkins core, `+cnj/t6-m6-stateless-sessions+`, `+cnj/t14-m1-resilience+` (REST stand-in), `+cnj/t15-remaining+` (CLI).
 * *Stapler:* prototype branch `+cnj/t6-m5-bound-id-prefix+`.
 * *Cluster plugins* (link:https://github.com/timja/cluster-plugin[timja/cluster-plugin]): `+OwnerRoutingFilter+`, `+Forwarding+`, `+WebSocketProxy+`, `+BoundRequestForwarder+`, `+ClusterCrumbIssuer+`, `+ChannelPublisher+`.
-* *Findings:* documents in the timja/cloud-native-jenkins repository (the prototype's notes and findings): `+findings/ET6-static-state.md+`, `+ET7-owner-routing.md+`, `+ET20-websocket-cli.md+`, `+ET21-browser.md+`.
+* *Evidence:* the acceptance scripts named under Testing print the measurements quoted in this JEP. The prototype's write-ups of those runs are available on request.
 
 == References
 
-* `+findings/E5-stateless-http.md+` in the timja/cloud-native-jenkins repository (the prototype's notes and findings): two controllers behind a load balancer without stickiness
+* The prototype's notes on the experiments summarised under Motivation are available on request.

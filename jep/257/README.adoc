@@ -40,6 +40,7 @@ endif::[]
 == Abstract
 
 Several controllers provision agents from the same clouds (Kubernetes, and by extension EC2, Docker and others) without over-provisioning, exceeding cluster-wide caps, or killing each other's agents.
+
 * Demand is counted once, by the controller that will run the build.
 * Agents being provisioned are reserved for the item they are for.
 * Caps are enforced through counters in the store.
@@ -50,7 +51,7 @@ Several controllers provision agents from the same clouds (Kubernetes, and by ex
 * *Demand counted once.* `+NodeProvisioner+` counts a queue item's demand only on the controller that will start it: the one that requested it, or that claimed it in the shared queue (`+QueueStartGate.countsForProvisioning+`). Mirrored items elsewhere do not provision.
 * *Reservations.* An agent provisioned for a queue item reserves the item (`+queue/reserved/<id>+`). Other controllers wait for it instead of starting the item on an agent they would provision too.
 * *Caps* across the cluster, through counters in the store (`+ClusterAgentLimits+`, `+jenkins_counters+`): each controller's share of a cloud's and template's cap. The kubernetes plugin consults them (`+ClusterProvisioningLimits+`). A dead controller's share lapses with its membership, and its counter rows are deleted. A counter back at zero is deleted too, so Pipelines declaring their own `+podTemplate+` (a template per build) leave no rows behind; an hourly pass prunes any left.
-* *Cloud agents are local.* Nodes created by a cloud are not shared through the store (`+PersistenceStores.keepLocal+`). Each controller manages and cleans up only its own. Static nodes are shared (JEP-250).
+* *Cloud agents are local.* Nodes created by a cloud are not shared through the store (`+PersistenceStores.keepLocal+`). Each controller manages and cleans up only its own. Static nodes are shared (JEP-250); for outbound launchers on a shared node, see Open questions.
 * *Placement.* A Pipeline whose `+node+` label only another controller can serve is handed over to it (JEP-252).
 * *Workspaces on pods.* An agent pod belongs to the controller that started it and goes with it. A build adopted after its controller died gets a new pod with an empty workspace, so files a later stage needs are carried with `+stash+`/`+unstash+` through an artifact manager keeping them in shared storage (JEP-202; the chart configures azure-artifact-manager).
 
@@ -71,11 +72,15 @@ Several controllers provision agents from the same clouds (Kubernetes, and by ex
 
 == Security
 
-Unchanged: clouds use their configured credentials on each controller.
+Unchanged: clouds use their configured credentials on each controller. Counters and reservations in the store are trusted by every controller (JEP-250).
 
 == Infrastructure Requirements
 
-There are no new infrastructure requirements related to this proposal.
+The infrastructure of JEP-255. The acceptance script runs the Helm chart on a Kubernetes cluster (kind).
+
+== Open questions
+
+* *Outbound (SSH-launched) static agents.* A static node is shared, so every controller has a computer for it and launches it. With an outbound launcher (SSH), every controller starts its own session to the same host: several Remoting JVMs in one remote root, the node's executors counted once per controller, and builds from different controllers using the same workspace directories at once. Core avoids a double launch only for cloud agents, and cloud agents are local (above), so this is specific to static outbound nodes. Options: a launch lease for the node so that only one controller connects and the others show the node as connected elsewhere (JEP-254), or supporting only inbound and cloud agents in the first version and refusing or warning about an outbound launcher on a shared node. No decision has been made; see also JEP-254.
 
 == Testing
 
@@ -91,7 +96,7 @@ There are no new infrastructure requirements related to this proposal.
 * *Core:* prototype branch of Jenkins core `+cnj/t9-m1-provisioning-demand+`.
 * *kubernetes plugin:* prototype branch `+cnj/t9-m2-cluster-cap+`.
 * *Cluster plugins* (link:https://github.com/timja/cluster-plugin[timja/cluster-plugin]): `+ClusterAgentLimits+`.
-* *Findings:* `+findings/ET9-kubernetes.md+`, a document in the timja/cloud-native-jenkins repository (the prototype's notes and findings).
+* *Evidence:* the acceptance scripts named under Testing print the measurements quoted in this JEP. The prototype's write-ups of those runs are available on request.
 
 == References
 
