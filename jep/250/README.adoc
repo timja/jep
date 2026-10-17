@@ -236,4 +236,5 @@ There are no new infrastructure requirements for Jenkins core. The reference bac
 | link:../257/README.adoc[257] | Cloud provisioning across controllers | 253, 255a
 | link:../255b/README.adoc[255b] | Operating a cluster (Informational) | 250–257
 |===
+
 * The prototype's notes on the experiments summarised under Motivation are available on request.
