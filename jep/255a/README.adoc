@@ -112,6 +112,12 @@ The cluster plugin receives changes to these keys through core's `+RemoteChangeH
 
 When an item is deleted, the controller where it was deleted deletes everything under `+_items/<uuid>+` and its blobs. A sweep, run on one controller, removes what a failed deletion left behind. A copy of an item, and an item made again with a deleted one's name, have new identities and start with nothing.
 
+=== Files the cluster plugin shares for others
+
+* *Copies made by `+getFile()+`* (JEP-250) that code changed with its own writer are written back to the store, merged against the content the copy was made from (through the same reconciler as conflicting saves), at the next `+getFile()+` and every minute.
+* *Plugin files in item and user directories.* Plugins that keep files next to an item's or a user's `+config.xml+` with their own file APIs (the avatar plugin keeps the user's image there) can have them shared, opt-in: every minute, each item's and user's directory is compared with what was last shared, and changed or removed files (up to 1 MiB each) are shared under the item's identity (above). Files declared local (each user's `+apiTokenStats.xml+`) are left out. The last writer of a file wins, and a plugin caching a file's content sees a change made elsewhere when it next reads the file. It is opt-in because it scans every item and user directory and the files' meaning is unknown to the cluster plugin.
+* *Files of plugins that do not declare them.* The cluster plugin declares `+SharedFiles+` and `+LocalFiles+` patterns (JEP-250) for plugins that need them and do not declare them yet, such as lockable-resources' manager file (local: its state is coordinated by `+LockCoordinator+`, JEP-253), so that those plugins keep their baselines.
+
 === Protocol and layout versions
 
 * Each controller publishes the cluster protocol it speaks. `+minimumPeerProtocol+` makes a new version refuse to start while older peers are alive, for changes that cannot coexist.
