@@ -51,8 +51,8 @@ The controller image defines the base plugin set. Runtime changes are an overlay
 
 * Store key `+cluster/plugins.json+` holds a generation and, per plugin, one of three states:
 ** `+installed+`, with version, sha256 and blob
+** `+disabled+`, keeping the version, sha256 and blob of a plugin the cluster installed, so that enabling it again restores it anywhere (a disabled plugin is not fetched where it is missing)
 ** `+uninstalled+`
-** `+disabled+`
 * Archives are the exact bytes the installing controller verified, stored under `+cluster-plugins/<name>/<sha256>.jpi+`, so no other controller needs the update center.
 * An installed entry applies only where the local version is missing or older. A newer image wins, and nothing is downgraded.
 * The cluster plugins themselves (`+cluster+` and its backends) cannot be changed at runtime (409).
@@ -71,7 +71,9 @@ The controller image defines the base plugin set. Runtime changes are an overlay
 
 === Apply
 
-* *When.* Every controller reconciles with the overlay when it changes, every minute, and once it is up.
+* *When.*
+** *At boot, on a fresh home* (no items, no saved queue), before anything is loaded (after `+PLUGINS_STARTED+`, before `+EXTENSIONS_AUGMENTED+`): the controller reads the overlay (the store plugin reads it without joining the cluster, since the store is set up only later) and fetches the plugins the cluster installed that its `+plugins/+` lacks or has older, verified. If it fetched any, it restarts once, so that global configuration, JCasC and jobs load with them, as with the image's plugins; loaded once up, they would be too late for those (jobs of their types would not load, and parts from them would be dropped and, once saved, removed for every controller). It is not ready until then. Where it cannot restart in place, or on a home that has loaded things before, they are applied once up.
+** *Once up,* every controller reconciles with the overlay when it changes, every minute, and once at the end of its start.
 * *How:*
 ** Missing plugins are fetched from blob storage, verified, and loaded live (`+PluginManager.dynamicLoad+`).
 ** Upgrades, uninstalls, disables and plugins that cannot load live are written to `+plugins/+` and applied by a restart.
