@@ -105,7 +105,7 @@ See JEP-251: the job page, the Builds card and the job's icon show them, and the
 * Controllers reach each other on internal URLs, which must not be reachable from outside the cluster network.
 * *Trust model.* The controllers of a cluster are one trust domain (JEP-250). A forwarding controller can act as any user on any other controller, since it relays the user's cookie and `+Authorization+` header; a compromised controller is a compromised cluster.
 * *Internal traffic SHOULD use TLS.* Forwarded requests carry credentials, and the chart's example internal URL (`+http://$(POD_IP):8080/+`) is plain HTTP. TLS between controllers is a deployment concern (a service mesh, or `+JENKINS_CLUSTER_INTERNAL_URL=https://…+`).
-* The loop guard, the header `+X-Jenkins-Cluster-Forwarded-From+`, can be set by a client. It can only keep a request from being forwarded, which gives no privilege; it is not to be trusted.
+* The loop guard, the header `+X-Jenkins-Cluster-Forwarded-From+`, carries the forwarding controller's name, a time and an HMAC under a confidential key shared through the store. A request counts as forwarded only if the MAC is valid and under 5 minutes old; a client's own copy of the header is dropped, not passed on.
 * *Sessions.* In cluster mode a sign-in is a bearer token valid until it expires or is revoked (above), instead of a server session that expires when idle.
 * A security review of the cross-controller interfaces is pending, through a separate process.
 

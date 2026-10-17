@@ -120,7 +120,7 @@ Pipeline logs use the existing external log storage API (JEP-210, `+LogStorageFa
 == Backwards Compatibility
 
 * Without a store, nothing changes.
-* *Known gap in the prototype:* its S3 chunked log (names chunks by offset and length, with a controller-local record of the end) and its Azure segment rollover do not yet meet the fencing requirement for a paused former owner. The requirement above is the specification; the prototype will be changed to meet it.
+* *How the reference implementation fences:* on S3, a writer that learns where a log ends from the store takes a higher epoch, records it next to the log, and names its chunks with it; an older writer is refused at its next append, and readers prefer the higher epoch at each offset. On Azure, which segment a block goes to depends only on that segment's block count, so two writers at one position always choose the same segment and only one append succeeds.
 * With one, plugins reading the build directory see a complete directory once the build is loaded.
 * Plugins writing to a completed build's directory have their files republished, within a minute during the first hour after completion, and within 10 minutes later.
 * Plugins keeping data keyed by job *name* outside `+JENKINS_HOME+` can key it by `+Item.getItemUuid()+` instead (JEP-250), which a rename does not change.
